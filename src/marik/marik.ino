@@ -1,7 +1,12 @@
 #include <Arduino.h>
+#include <ESP_I2S.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include "startup_greeting.h"
 
 constexpr uint8_t OLED_SCL_PIN = 1;
 constexpr uint8_t OLED_SDA_PIN = 2;
@@ -11,6 +16,10 @@ constexpr uint8_t MPU_SCL_PIN = 5;
 constexpr uint8_t MPU_SDA_PIN = 6;
 constexpr uint8_t TOUCH_PIN = 4;
 constexpr int TOUCH_ACTIVE_LEVEL = HIGH;
+constexpr int8_t AUDIO_BCLK_PIN = 8;
+constexpr int8_t AUDIO_LRC_PIN = 9;
+constexpr int8_t AUDIO_DATA_PIN = 7;
+constexpr uint32_t AUDIO_SAMPLE_RATE_HZ = 16000;
 
 constexpr uint32_t FRAME_INTERVAL_MS = 40;
 constexpr uint32_t STARTUP_DURATION_MS = 1200;
@@ -376,6 +385,46 @@ void renderFace(uint32_t elapsed) {
   }
 }
 
+void playStartupGreeting() {
+  I2SClass audio;
+  audio.setPins(AUDIO_BCLK_PIN, AUDIO_LRC_PIN, AUDIO_DATA_PIN);
+  if (!audio.begin(I2S_MODE_STD, AUDIO_SAMPLE_RATE_HZ, I2S_DATA_BIT_WIDTH_16BIT,
+                   I2S_SLOT_MODE_STEREO)) {
+    Serial.println("I2S initialization failed.");
+    return;
+  }
+
+  // Let the amplifier settle after the I2S clocks start.
+  delay(150);
+  constexpr size_t framesPerWrite = 256;
+  int16_t stereo[framesPerWrite][2];
+  const int8_t *encoded = STARTUP_GREETING_DELTAS;
+  int16_t sample = 0;
+  for (size_t offset = 0; offset < STARTUP_GREETING_SAMPLE_COUNT; offset += framesPerWrite) {
+    const size_t frames = min(STARTUP_GREETING_SAMPLE_COUNT - offset, framesPerWrite);
+    for (size_t i = 0; i < frames; ++i) {
+      const int8_t delta = *encoded++;
+      if (delta == INT8_MIN) {
+        const int8_t highByte = *encoded++;
+        const uint8_t lowByte = static_cast<uint8_t>(*encoded++);
+        sample = highByte * 256 + lowByte;
+      } else {
+        sample += delta;
+      }
+      // Use both slots so the amplifier can select either channel.
+      stereo[i][0] = sample;
+      stereo[i][1] = sample;
+    }
+    const size_t bytes = frames * sizeof(stereo[0]);
+    if (audio.write(reinterpret_cast<uint8_t *>(stereo), bytes) != bytes) {
+      Serial.println("I2S playback failed.");
+      break;
+    }
+  }
+  // Let queued DMA samples play before the I2S object is destroyed.
+  delay(150);
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(TOUCH_PIN, INPUT_PULLDOWN);
@@ -383,6 +432,13 @@ void setup() {
   mpuAddress = beginMpu();
   lastOledAttemptAt = millis();
   lastMpuAttemptAt = lastOledAttemptAt;
+  // I2S writes can block while DMA is full. Keep the face animation on the main task.
+  if (xTaskCreate([](void *) {
+        playStartupGreeting();
+        vTaskDelete(nullptr);
+      }, "startupGreeting", 4096, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("Could not start the greeting task.");
+  }
   if (oledReady) {
     setFace(Face::Startup, lastOledAttemptAt);
     lastFrameAt = faceStartedAt;
